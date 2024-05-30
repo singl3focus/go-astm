@@ -15,7 +15,7 @@ var (
 	ErrLineContention  = errors.New("line contention")
 	ErrNotAcknowledged = errors.New("frame not acknowledged")
 
-	defaultTimeout = 10 * time.Second
+	defaultTimeout = 15 * time.Second
 )
 
 type Conn struct {
@@ -28,12 +28,12 @@ type Conn struct {
 
 	conn io.ReadWriteCloser
 	// signals pending write transactions to give control to instrument
-	releaseCh chan struct{}
-	ackCh     chan struct{}
-	nakCh     chan struct{}
-	enqCh     chan struct{}
-	eotCh     chan struct{}
-	stxCh     chan []byte
+	releaseCh      chan struct{}
+	ackCh          chan struct{}
+	nakCh          chan struct{}
+	startRequestCh chan struct{}
+	eotCh          chan struct{}
+	stxCh          chan []byte
 }
 
 type stateFunc func(*stateContext) (stateFunc, error)
@@ -46,7 +46,7 @@ type stateContext struct {
 func Listen(rwc io.ReadWriteCloser) *Conn {
 	c := &Conn{}
 	c.conn = rwc
-	c.enqCh = make(chan struct{})
+	c.startRequestCh = make(chan struct{})
 	c.ackCh = make(chan struct{})
 	c.nakCh = make(chan struct{})
 	c.eotCh = make(chan struct{})
@@ -58,7 +58,7 @@ func Listen(rwc io.ReadWriteCloser) *Conn {
 	next := c.waiting
 
 	go func() {
-		defer close(c.enqCh)
+		defer close(c.startRequestCh)
 		ctx := &stateContext{
 			in: bufio.NewReader(c.conn),
 		}
@@ -85,12 +85,14 @@ func (c *Conn) waiting(sc *stateContext) (stateFunc, error) {
 		switch b {
 		case ENQ:
 			return c.establishing, nil
+		case SOH:
+			return c.establishing, nil
 		case ACK:
 			return c.notify(c.ackCh, c.Timeout, c.waiting), nil
 		case NAK:
 			return c.notify(c.nakCh, c.Timeout, c.waiting), nil
 		default:
-			err := c.writeByte(NAK)
+			err := c.WriteByte(NAK)
 			return c.waiting, err
 		}
 	}
@@ -101,7 +103,7 @@ func (c *Conn) notify(ch chan struct{}, timeout time.Duration, next stateFunc) s
 		select {
 		case ch <- struct{}{}:
 		case <-time.After(timeout):
-			if err := c.writeByte(NAK); err != nil {
+			if err := c.WriteByte(NAK); err != nil {
 				return c.waiting, nil
 			}
 		}
@@ -116,10 +118,10 @@ func (c *Conn) establishing(sc *stateContext) (stateFunc, error) {
 	}
 
 	select {
-	case c.enqCh <- struct{}{}:
-		return c.receiving, c.writeByte(ACK)
+	case c.startRequestCh <- struct{}{}:
+		return c.receiving, c.WriteByte(ACK)
 	case <-time.After(c.Timeout):
-		err := c.writeByte(NAK)
+		err := c.WriteByte(NAK)
 		return c.waiting, err
 	}
 }
@@ -135,7 +137,7 @@ func (c *Conn) receiving(sc *stateContext) (stateFunc, error) {
 	case STX:
 		return c.processing, nil
 	default:
-		err := c.writeByte(NAK)
+		err := c.WriteByte(NAK)
 		return c.waiting, err
 	}
 }
@@ -170,7 +172,7 @@ func (c *Conn) processing(sc *stateContext) (stateFunc, error) {
 	cs := rest[0:2]
 
 	if got != string(cs) {
-		err := c.writeByte(NAK)
+		err := c.WriteByte(NAK)
 		return c.receiving, err
 	}
 
@@ -179,9 +181,9 @@ func (c *Conn) processing(sc *stateContext) (stateFunc, error) {
 
 	select {
 	case c.stxCh <- out:
-		err = c.writeByte(ACK)
+		err = c.WriteByte(ACK)
 	case <-time.After(c.Timeout):
-		err = c.writeByte(NAK)
+		err = c.WriteByte(NAK)
 	}
 
 	return c.receiving, err
@@ -191,12 +193,12 @@ func (c *Conn) processing(sc *stateContext) (stateFunc, error) {
 // the request with <ACK>, then returns a *TransactionReader ready to read from
 // the underlying connection.
 func (c *Conn) Acknowledge() (*TransactionReader, error) {
-	_, ok := <-c.enqCh
+	_, ok := <-c.startRequestCh
 	if !ok {
 		return nil, errors.New("connection closed")
 	}
 
-	return &TransactionReader{c: c, timeout: c.Timeout}, nil
+	return &TransactionReader{C: c, timeout: c.Timeout}, nil
 }
 
 // RequestControl attempts to establish control of the connection. If successful,
@@ -234,14 +236,14 @@ func (c *Conn) RequestControlContext(ctx context.Context) (*TransactionWriter, e
 }
 
 func (c *Conn) requestControl(ctx context.Context) (*TransactionWriter, error) {
-	err := c.writeByte(ENQ)
+	err := c.WriteByte(ENQ)
 	if err != nil {
 		return nil, err
 	}
 
 	select {
 	case <-c.ackCh:
-		return &TransactionWriter{c: c, timeout: c.Timeout}, nil
+		return &TransactionWriter{C: c, timeout: c.Timeout}, nil
 	case <-c.releaseCh:
 		return nil, ErrLineContention
 	case <-c.nakCh:
@@ -260,14 +262,15 @@ func (c *Conn) write(b []byte) (int, error) {
 	return c.conn.Write(b)
 }
 
-func (c *Conn) writeByte(b byte) error {
+func (c *Conn) WriteByte(b byte) error {
 	_, err := c.write([]byte{b})
 	return err
 }
 
 // TransactionReader represents a request by the instrument to send a message
+// Using the Connection 'C' field, you can test your applications by sending bytes to the recipient.
 type TransactionReader struct {
-	c       *Conn
+	C       *Conn
 	timeout time.Duration
 	closed  bool
 }
@@ -295,10 +298,10 @@ func (tr *TransactionReader) read(b []byte, ctx context.Context) (n int, err err
 	}()
 
 	select {
-	case fr := <-tr.c.stxCh:
+	case fr := <-tr.C.stxCh:
 		n := copy(b, fr)
 		return n, nil
-	case <-tr.c.eotCh:
+	case <-tr.C.eotCh:
 		return 0, io.EOF
 	case <-ctx.Done():
 		return 0, errors.New("read timeout")
@@ -312,8 +315,9 @@ func (tr *TransactionReader) SetReadTimeout(d time.Duration) {
 }
 
 // A TransactionWriter is a Writer that writes frames to the underlying connection.
+// Using the Connection 'C' field, you can test your applications by sending bytes to the recipient.
 type TransactionWriter struct {
-	c       *Conn
+	C       *Conn
 	closed  bool
 	timeout time.Duration
 }
@@ -340,17 +344,17 @@ func (tr *TransactionWriter) Write(b []byte) (int, error) {
 }
 
 func (tr *TransactionWriter) write(b []byte, ctx context.Context) (int, error) {
-	n, err := tr.c.write(b)
+	n, err := tr.C.write(b)
 	if err != nil {
 		return n, err
 	}
 
 	select {
-	case <-tr.c.ackCh:
+	case <-tr.C.ackCh:
 		return n, nil
-	case <-tr.c.nakCh:
+	case <-tr.C.nakCh:
 		return n, ErrNotAcknowledged
-	case <-tr.c.releaseCh:
+	case <-tr.C.releaseCh:
 		tr.closed = true
 		return n, ErrLineContention
 	case <-ctx.Done():
@@ -367,5 +371,5 @@ func (tr *TransactionWriter) Close() error {
 	}
 
 	tr.closed = true
-	return tr.c.writeByte(EOT)
+	return tr.C.WriteByte(EOT)
 }

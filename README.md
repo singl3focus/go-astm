@@ -10,6 +10,21 @@ familiar interfaces.
 
 Because `Listen()` wraps any `io.ReadWriteCloser`, the library works with serial or TCP interfaces.
 
+## Description of commits
+
+|   Name   | Description                                                     |
+|----------|-----------------------------------------------------------------|
+| build	   | Building a project or changing external dependencies            |
+| sec      | Security                                                        |
+| docs	   | Update documentation                                            |
+| feat	   | Add a new features                                              |
+| fix	   | Fixing errors                                                   |
+| perf	   | Changes aimed at improving performance                          |
+| refactor | Code edits without correcting errors or adding new features     |
+| revert   | Rollback to previous commits                                    |
+| style	   | Code style edits (tabs, indents, dots, commas, etc.)            |
+| test	   | Add the tests                                                   |
+
 ## Examples
 
 ### Single-directional Serial communication
